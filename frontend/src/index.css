@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root { height: 100%; }
+
+.score-svg svg { width: 100%; height: auto; display: block; }
+.score-svg .anno { cursor: pointer; }
