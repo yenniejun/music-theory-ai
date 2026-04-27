@@ -21,6 +21,9 @@ dist/
 .coverage
 htmlcov/
 
+# Local logs
+*.log
+
 # Oemer model cache
 *.onnx
 checkpoints/
