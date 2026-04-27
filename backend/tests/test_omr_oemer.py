@@ -25,20 +25,20 @@ def _fake_streamer(write_to: str, returncode: int = 0, output: str = ""):
     return runner
 
 
-def test_oemer_happy_path(monkeypatch):
+def test_oemer_happy_path(monkeypatch, tmp_path):
     monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")
     with patch("services.omr._run_streaming", side_effect=_fake_streamer(SAMPLE_XML)):
-        out = OemerOMR(max_dim=0).image_to_musicxml(b"fake-png-bytes", media_type="image/png")
+        out = OemerOMR(max_dim=0, cache_dir=str(tmp_path)).image_to_musicxml(b"fake-png-bytes", media_type="image/png")
     assert out == SAMPLE_XML
 
 
-def test_oemer_missing_binary_raises(monkeypatch):
+def test_oemer_missing_binary_raises(monkeypatch, tmp_path):
     monkeypatch.setattr("services.omr._find_executable", lambda name: None)
     with pytest.raises(RuntimeError, match="oemer binary"):
-        OemerOMR(max_dim=0).image_to_musicxml(b"x")
+        OemerOMR(max_dim=0, cache_dir=str(tmp_path)).image_to_musicxml(b"x")
 
 
-def test_oemer_pdf_is_converted_to_png(monkeypatch):
+def test_oemer_pdf_is_converted_to_png(monkeypatch, tmp_path):
     monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")
     monkeypatch.setattr("services.omr._pdf_to_png_bytes", lambda b, **kw: b"PNG-BYTES")
 
@@ -54,20 +54,20 @@ def test_oemer_pdf_is_converted_to_png(monkeypatch):
         return _StreamResult(0, "")
 
     with patch("services.omr._run_streaming", side_effect=runner):
-        OemerOMR(max_dim=0).image_to_musicxml(b"PDF-BYTES", media_type="application/pdf")
+        OemerOMR(max_dim=0, cache_dir=str(tmp_path)).image_to_musicxml(b"PDF-BYTES", media_type="application/pdf")
 
     assert captured["ext"] == ".png"
     assert captured["bytes"] == b"PNG-BYTES"
 
 
-def test_oemer_propagates_nonzero_exit(monkeypatch):
+def test_oemer_propagates_nonzero_exit(monkeypatch, tmp_path):
     monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")
     with patch("services.omr._run_streaming", side_effect=_fake_streamer(None, returncode=1, output="bad image")):
         with pytest.raises(RuntimeError, match="bad image"):
-            OemerOMR(max_dim=0).image_to_musicxml(b"x", media_type="image/png")
+            OemerOMR(max_dim=0, cache_dir=str(tmp_path)).image_to_musicxml(b"x", media_type="image/png")
 
 
-def test_oemer_handles_no_output_file(monkeypatch):
+def test_oemer_handles_no_output_file(monkeypatch, tmp_path):
     monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")
 
     def empty(cmd, timeout):
@@ -75,10 +75,10 @@ def test_oemer_handles_no_output_file(monkeypatch):
 
     with patch("services.omr._run_streaming", side_effect=empty):
         with pytest.raises(RuntimeError, match="no MusicXML"):
-            OemerOMR(max_dim=0).image_to_musicxml(b"x", media_type="image/png")
+            OemerOMR(max_dim=0, cache_dir=str(tmp_path)).image_to_musicxml(b"x", media_type="image/png")
 
 
-def test_oemer_timeout_wraps_subprocess_timeout(monkeypatch):
+def test_oemer_timeout_wraps_subprocess_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")
 
     def slow(cmd, timeout):
@@ -86,7 +86,62 @@ def test_oemer_timeout_wraps_subprocess_timeout(monkeypatch):
 
     with patch("services.omr._run_streaming", side_effect=slow):
         with pytest.raises(RuntimeError, match="timed out"):
-            OemerOMR(timeout_seconds=1, max_dim=0).image_to_musicxml(b"x", media_type="image/png")
+            OemerOMR(timeout_seconds=1, max_dim=0, cache_dir=str(tmp_path)).image_to_musicxml(b"x", media_type="image/png")
+
+
+def test_oemer_cache_hit_skips_oemer(monkeypatch, tmp_path):
+    """If the cached MusicXML for this content hash already exists, oemer is not invoked."""
+    monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")
+    import hashlib
+    digest = hashlib.sha256(b"fake-png-bytes").hexdigest()[:16]
+    (tmp_path / f"{digest}.musicxml").write_text(SAMPLE_XML)
+
+    called = {"count": 0}
+
+    def should_not_run(cmd, timeout):
+        called["count"] += 1
+        return _StreamResult(0, "")
+
+    with patch("services.omr._run_streaming", side_effect=should_not_run):
+        out = OemerOMR(max_dim=0, cache_dir=str(tmp_path)).image_to_musicxml(
+            b"fake-png-bytes", media_type="image/png"
+        )
+    assert out == SAMPLE_XML
+    assert called["count"] == 0  # oemer was never invoked
+
+
+def test_oemer_writes_cache_after_run(monkeypatch, tmp_path):
+    """A successful run persists the MusicXML by content hash for next time."""
+    monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")
+    with patch("services.omr._run_streaming", side_effect=_fake_streamer(SAMPLE_XML)):
+        OemerOMR(max_dim=0, cache_dir=str(tmp_path)).image_to_musicxml(
+            b"fake-png-bytes", media_type="image/png"
+        )
+
+    import hashlib
+    digest = hashlib.sha256(b"fake-png-bytes").hexdigest()[:16]
+    cached = tmp_path / f"{digest}.musicxml"
+    assert cached.exists()
+    assert cached.read_text() == SAMPLE_XML
+
+
+def test_oemer_passes_save_cache_flag(monkeypatch, tmp_path):
+    """The --save-cache flag is passed to oemer so its inference pickles persist."""
+    monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")
+    captured = {}
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        out_idx = cmd.index("-o") + 1
+        Path(cmd[out_idx], "score.musicxml").write_text(SAMPLE_XML)
+        return _StreamResult(0, "")
+
+    with patch("services.omr._run_streaming", side_effect=runner):
+        OemerOMR(max_dim=0, cache_dir=str(tmp_path)).image_to_musicxml(
+            b"fake-png-bytes", media_type="image/png"
+        )
+
+    assert "--save-cache" in captured["cmd"]
 
 
 def test_downscale_resizes_when_above_max_dim():
@@ -118,7 +173,7 @@ def test_downscale_passthrough_when_below_max_dim():
     assert out is raw  # no resize, original bytes returned
 
 
-def test_oemer_passes_without_deskew_flag(monkeypatch):
+def test_oemer_passes_without_deskew_flag(monkeypatch, tmp_path):
     monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")
     captured_cmd = {}
 
@@ -129,6 +184,6 @@ def test_oemer_passes_without_deskew_flag(monkeypatch):
         return _StreamResult(0, "")
 
     with patch("services.omr._run_streaming", side_effect=runner):
-        OemerOMR(without_deskew=True, max_dim=0).image_to_musicxml(b"x", media_type="image/png")
+        OemerOMR(without_deskew=True, max_dim=0, cache_dir=str(tmp_path)).image_to_musicxml(b"x", media_type="image/png")
 
     assert "-d" in captured_cmd["cmd"]

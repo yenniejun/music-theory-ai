@@ -8,6 +8,7 @@ Adapters for Claude Vision and Audiveris are kept for comparison/upgrade.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import os
 import re
@@ -129,7 +130,8 @@ class OemerOMR:
     """
 
     def __init__(self, oemer_bin: str | None = None, timeout_seconds: int | None = None,
-                 without_deskew: bool | None = None, max_dim: int | None = None):
+                 without_deskew: bool | None = None, max_dim: int | None = None,
+                 cache_dir: str | None = None):
         self.oemer_bin = oemer_bin or os.environ.get("OEMER_BIN", "oemer")
         self.timeout_seconds = (
             timeout_seconds
@@ -146,6 +148,8 @@ class OemerOMR:
             if max_dim is not None
             else int(os.environ.get("OEMER_MAX_DIM", "2000"))
         )
+        cache_path = cache_dir or os.environ.get("OEMER_CACHE_DIR")
+        self.cache_dir = Path(cache_path) if cache_path else Path.home() / ".cache" / "scorelayer" / "oemer"
 
     def image_to_musicxml(self, image_bytes: bytes, media_type: str = "image/png") -> str:
         resolved = _find_executable(self.oemer_bin)
@@ -165,34 +169,45 @@ class OemerOMR:
             image_bytes = _downscale_png(image_bytes, max_dim=self.max_dim)
             ext = ".png"
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            img_path = tmp / f"score{ext}"
-            img_path.write_bytes(image_bytes)
+        digest = hashlib.sha256(image_bytes).hexdigest()[:16]
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        cached_xml = self.cache_dir / f"{digest}.musicxml"
+        if cached_xml.exists():
+            log.info("Cache hit (%s) — skipping oemer", digest)
+            return cached_xml.read_text(encoding="utf-8")
 
-            cmd = [resolved, str(img_path), "-o", str(tmp)]
-            if self.without_deskew:
-                cmd.append("-d")
-            log.info("Running oemer (timeout=%ss): %s", self.timeout_seconds, " ".join(cmd))
-            try:
-                result = _run_streaming(cmd, timeout=self.timeout_seconds)
-            except subprocess.TimeoutExpired as e:
-                raise RuntimeError(
-                    f"oemer timed out after {self.timeout_seconds}s. "
-                    "Bump OEMER_TIMEOUT or try a smaller / less dense image."
-                ) from e
+        # Persistent per-image directory so oemer's --save-cache pickles
+        # are reused if the same image is re-uploaded.
+        work_dir = self.cache_dir / digest
+        work_dir.mkdir(parents=True, exist_ok=True)
+        img_path = work_dir / f"score{ext}"
+        img_path.write_bytes(image_bytes)
 
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"oemer exited {result.returncode}: {result.output.strip()[-500:]}"
-                )
+        cmd = [resolved, str(img_path), "-o", str(work_dir), "--save-cache"]
+        if self.without_deskew:
+            cmd.append("-d")
+        log.info("Running oemer (timeout=%ss): %s", self.timeout_seconds, " ".join(cmd))
+        try:
+            result = _run_streaming(cmd, timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"oemer timed out after {self.timeout_seconds}s. "
+                "Bump OEMER_TIMEOUT or try a smaller / less dense image."
+            ) from e
 
-            xml_files = list(tmp.glob("*.musicxml")) + list(tmp.glob("*.xml"))
-            if not xml_files:
-                raise RuntimeError(
-                    f"oemer produced no MusicXML output. output={result.output!r}"
-                )
-            return xml_files[0].read_text(encoding="utf-8")
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"oemer exited {result.returncode}: {result.output.strip()[-500:]}"
+            )
+
+        xml_files = list(work_dir.glob("*.musicxml")) + list(work_dir.glob("*.xml"))
+        if not xml_files:
+            raise RuntimeError(
+                f"oemer produced no MusicXML output. output={result.output!r}"
+            )
+        xml = xml_files[0].read_text(encoding="utf-8")
+        cached_xml.write_text(xml, encoding="utf-8")
+        return xml
 
 
 # ---------------------------------------------------------------------------
