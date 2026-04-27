@@ -1,0 +1,4 @@
+# Drop sheet-music screenshots (.png/.jpg/.pdf) here.
+# tests/test_integration_omr.py will pick them up automatically and
+# run the full OMR -> analyzer pipeline against them. Requires
+# ANTHROPIC_API_KEY to be set; otherwise tests are skipped.

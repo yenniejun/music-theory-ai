@@ -1,0 +1,246 @@
+"""OMR service: image bytes -> MusicXML string.
+
+Provider-agnostic so we can swap the engine without touching call sites.
+Currently defaults to Oemer (open-source deep-learning OMR, pip-installable).
+Adapters for Claude Vision and Audiveris are kept for comparison/upgrade.
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Protocol
+
+
+def _find_executable(name: str) -> str | None:
+    """Resolve a CLI tool that may be installed in the active venv but not on PATH."""
+    found = shutil.which(name)
+    if found:
+        return found
+    candidate = Path(sys.executable).parent / name
+    if candidate.exists():
+        return str(candidate)
+    return None
+
+log = logging.getLogger(__name__)
+
+
+class OMRProvider(Protocol):
+    def image_to_musicxml(self, image_bytes: bytes, media_type: str) -> str: ...
+
+
+# ---------------------------------------------------------------------------
+# Default: Oemer (https://github.com/BreezeWhite/oemer)
+# ---------------------------------------------------------------------------
+
+_MEDIA_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "application/pdf": ".pdf",
+}
+
+
+def _pdf_to_png_bytes(pdf_bytes: bytes, dpi: int = 300, page: int = 0) -> bytes:
+    """Render the given page of a PDF to PNG bytes (first page by default)."""
+    import fitz  # PyMuPDF
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if page >= doc.page_count:
+        raise RuntimeError(f"PDF has {doc.page_count} pages; requested page {page}")
+    pix = doc.load_page(page).get_pixmap(dpi=dpi)
+    return pix.tobytes("png")
+
+
+class OemerOMR:
+    """OMR backed by the `oemer` CLI.
+
+    Oemer takes an image path and writes a `.musicxml` file beside it
+    (or into a directory specified with `-o`). We shell out, then read
+    the result back.
+    """
+
+    def __init__(self, oemer_bin: str | None = None, timeout_seconds: int = 240):
+        self.oemer_bin = oemer_bin or os.environ.get("OEMER_BIN", "oemer")
+        self.timeout_seconds = timeout_seconds
+
+    def image_to_musicxml(self, image_bytes: bytes, media_type: str = "image/png") -> str:
+        resolved = _find_executable(self.oemer_bin)
+        if resolved is None:
+            raise RuntimeError(
+                f"oemer binary '{self.oemer_bin}' not found on PATH or next to {sys.executable}. "
+                "Install with `pip install oemer` (first run will download ONNX models)."
+            )
+
+        ext = _MEDIA_EXT.get(media_type.lower(), ".png")
+        if ext == ".pdf":
+            log.info("Converting PDF first page to PNG for Oemer")
+            image_bytes = _pdf_to_png_bytes(image_bytes)
+            ext = ".png"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            img_path = tmp / f"score{ext}"
+            img_path.write_bytes(image_bytes)
+
+            cmd = [resolved, str(img_path), "-o", str(tmp)]
+            log.info("Running oemer: %s", " ".join(cmd))
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise RuntimeError(f"oemer timed out after {self.timeout_seconds}s") from e
+
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"oemer exited {result.returncode}: {result.stderr.strip() or result.stdout.strip()}"
+                )
+
+            xml_files = list(tmp.glob("*.musicxml")) + list(tmp.glob("*.xml"))
+            if not xml_files:
+                raise RuntimeError(
+                    f"oemer produced no MusicXML output. stdout={result.stdout!r} stderr={result.stderr!r}"
+                )
+            return xml_files[0].read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Alternative: Audiveris (FOSS, Java-based; needs the `audiveris` CLI on PATH
+# or a Docker wrapper). Kept here as the upgrade path for higher accuracy.
+# ---------------------------------------------------------------------------
+
+
+class AudiverisOMR:
+    def __init__(self, audiveris_bin: str | None = None, timeout_seconds: int = 600):
+        self.audiveris_bin = audiveris_bin or os.environ.get("AUDIVERIS_BIN", "audiveris")
+        self.timeout_seconds = timeout_seconds
+
+    def image_to_musicxml(self, image_bytes: bytes, media_type: str = "image/png") -> str:
+        resolved = _find_executable(self.audiveris_bin)
+        if resolved is None:
+            raise RuntimeError(
+                f"audiveris binary '{self.audiveris_bin}' not found on PATH."
+            )
+
+        ext = _MEDIA_EXT.get(media_type.lower(), ".png")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            img_path = tmp / f"score{ext}"
+            img_path.write_bytes(image_bytes)
+
+            cmd = [
+                resolved, "-batch", "-export",
+                "-output", str(tmp), "--", str(img_path),
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=self.timeout_seconds, check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"audiveris exited {result.returncode}: {result.stderr}")
+
+            xml_files = list(tmp.rglob("*.mxl")) + list(tmp.rglob("*.xml"))
+            if not xml_files:
+                raise RuntimeError("audiveris produced no MusicXML output")
+
+            target = xml_files[0]
+            if target.suffix == ".mxl":
+                import zipfile
+                with zipfile.ZipFile(target) as zf:
+                    inner = next((n for n in zf.namelist() if n.endswith(".xml") and "META" not in n), None)
+                    if inner is None:
+                        raise RuntimeError("Could not find XML inside .mxl archive")
+                    return zf.read(inner).decode("utf-8")
+            return target.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Alternative: Claude Vision (LLM-based — kept for benchmarking).
+# ---------------------------------------------------------------------------
+
+
+CLAUDE_OMR_PROMPT = """You are an Optical Music Recognition (OMR) engine.
+
+Given the attached image of sheet music, return a complete, well-formed
+MusicXML 4.0 document. Output only XML — no commentary or code fences.
+"""
+
+
+class ClaudeVisionOMR:
+    def __init__(self, model: str = "claude-sonnet-4-20250514", api_key: str | None = None):
+        from anthropic import Anthropic
+        self.model = model
+        self.client = Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+
+    def image_to_musicxml(self, image_bytes: bytes, media_type: str = "image/png") -> str:
+        b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=16000,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                    {"type": "text", "text": CLAUDE_OMR_PROMPT},
+                ],
+            }],
+        )
+        text = "".join(block.text for block in response.content if block.type == "text")
+        return _extract_musicxml(text)
+
+
+def _extract_musicxml(text: str) -> str:
+    """Strip code fences or stray prose, keep the XML."""
+    text = text.strip()
+    fence = re.match(r"^```(?:xml)?\s*(.*?)\s*```$", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    start = text.find("<?xml")
+    if start == -1:
+        start = text.find("<score-partwise")
+    if start > 0:
+        text = text[start:]
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Provider selection
+# ---------------------------------------------------------------------------
+
+_PROVIDERS = {
+    "oemer": OemerOMR,
+    "audiveris": AudiverisOMR,
+    "claude": ClaudeVisionOMR,
+}
+
+_DEFAULT_PROVIDER: OMRProvider | None = None
+
+
+def get_provider() -> OMRProvider:
+    global _DEFAULT_PROVIDER
+    if _DEFAULT_PROVIDER is None:
+        name = os.environ.get("OMR_PROVIDER", "oemer").lower()
+        cls = _PROVIDERS.get(name, OemerOMR)
+        _DEFAULT_PROVIDER = cls()
+    return _DEFAULT_PROVIDER
+
+
+def set_provider(provider: OMRProvider) -> None:
+    """Override the active provider — handy for tests."""
+    global _DEFAULT_PROVIDER
+    _DEFAULT_PROVIDER = provider
+
+
+def image_to_musicxml(image_bytes: bytes, media_type: str = "image/png") -> str:
+    return get_provider().image_to_musicxml(image_bytes, media_type)
