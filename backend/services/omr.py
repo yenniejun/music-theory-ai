@@ -94,6 +94,32 @@ def _pdf_to_png_bytes(pdf_bytes: bytes, dpi: int = 300, page: int = 0) -> bytes:
     return pix.tobytes("png")
 
 
+def _downscale_png(image_bytes: bytes, max_dim: int = 2000) -> bytes:
+    """Downscale an image so its longest edge is at most `max_dim` pixels.
+
+    Oemer's runtime scales with pixel count; large uploads are the #1 source
+    of multi-minute waits. Downscaling to 2000px usually preserves enough
+    detail for note-head segmentation while running 3-4x faster.
+    """
+    from io import BytesIO
+    from PIL import Image
+
+    img = Image.open(BytesIO(image_bytes))
+    w, h = img.size
+    longest = max(w, h)
+    if longest <= max_dim:
+        return image_bytes
+    scale = max_dim / longest
+    new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    log.info("Downscaling input: %dx%d -> %dx%d", w, h, *new_size)
+    resized = img.resize(new_size, Image.LANCZOS)
+    if resized.mode != "RGB":
+        resized = resized.convert("RGB")
+    out = BytesIO()
+    resized.save(out, format="PNG", optimize=True)
+    return out.getvalue()
+
+
 class OemerOMR:
     """OMR backed by the `oemer` CLI.
 
@@ -103,7 +129,7 @@ class OemerOMR:
     """
 
     def __init__(self, oemer_bin: str | None = None, timeout_seconds: int | None = None,
-                 without_deskew: bool | None = None):
+                 without_deskew: bool | None = None, max_dim: int | None = None):
         self.oemer_bin = oemer_bin or os.environ.get("OEMER_BIN", "oemer")
         self.timeout_seconds = (
             timeout_seconds
@@ -114,6 +140,11 @@ class OemerOMR:
             without_deskew
             if without_deskew is not None
             else os.environ.get("OEMER_NO_DESKEW", "").lower() in ("1", "true", "yes")
+        )
+        self.max_dim = (
+            max_dim
+            if max_dim is not None
+            else int(os.environ.get("OEMER_MAX_DIM", "2000"))
         )
 
     def image_to_musicxml(self, image_bytes: bytes, media_type: str = "image/png") -> str:
@@ -128,6 +159,10 @@ class OemerOMR:
         if ext == ".pdf":
             log.info("Converting PDF first page to PNG for Oemer")
             image_bytes = _pdf_to_png_bytes(image_bytes)
+            ext = ".png"
+
+        if self.max_dim > 0:
+            image_bytes = _downscale_png(image_bytes, max_dim=self.max_dim)
             ext = ".png"
 
         with tempfile.TemporaryDirectory() as tmpdir:

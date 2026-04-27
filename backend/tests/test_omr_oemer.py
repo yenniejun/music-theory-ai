@@ -28,14 +28,14 @@ def _fake_streamer(write_to: str, returncode: int = 0, output: str = ""):
 def test_oemer_happy_path(monkeypatch):
     monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")
     with patch("services.omr._run_streaming", side_effect=_fake_streamer(SAMPLE_XML)):
-        out = OemerOMR().image_to_musicxml(b"fake-png-bytes", media_type="image/png")
+        out = OemerOMR(max_dim=0).image_to_musicxml(b"fake-png-bytes", media_type="image/png")
     assert out == SAMPLE_XML
 
 
 def test_oemer_missing_binary_raises(monkeypatch):
     monkeypatch.setattr("services.omr._find_executable", lambda name: None)
     with pytest.raises(RuntimeError, match="oemer binary"):
-        OemerOMR().image_to_musicxml(b"x")
+        OemerOMR(max_dim=0).image_to_musicxml(b"x")
 
 
 def test_oemer_pdf_is_converted_to_png(monkeypatch):
@@ -54,7 +54,7 @@ def test_oemer_pdf_is_converted_to_png(monkeypatch):
         return _StreamResult(0, "")
 
     with patch("services.omr._run_streaming", side_effect=runner):
-        OemerOMR().image_to_musicxml(b"PDF-BYTES", media_type="application/pdf")
+        OemerOMR(max_dim=0).image_to_musicxml(b"PDF-BYTES", media_type="application/pdf")
 
     assert captured["ext"] == ".png"
     assert captured["bytes"] == b"PNG-BYTES"
@@ -64,7 +64,7 @@ def test_oemer_propagates_nonzero_exit(monkeypatch):
     monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")
     with patch("services.omr._run_streaming", side_effect=_fake_streamer(None, returncode=1, output="bad image")):
         with pytest.raises(RuntimeError, match="bad image"):
-            OemerOMR().image_to_musicxml(b"x", media_type="image/png")
+            OemerOMR(max_dim=0).image_to_musicxml(b"x", media_type="image/png")
 
 
 def test_oemer_handles_no_output_file(monkeypatch):
@@ -75,7 +75,7 @@ def test_oemer_handles_no_output_file(monkeypatch):
 
     with patch("services.omr._run_streaming", side_effect=empty):
         with pytest.raises(RuntimeError, match="no MusicXML"):
-            OemerOMR().image_to_musicxml(b"x", media_type="image/png")
+            OemerOMR(max_dim=0).image_to_musicxml(b"x", media_type="image/png")
 
 
 def test_oemer_timeout_wraps_subprocess_timeout(monkeypatch):
@@ -86,7 +86,36 @@ def test_oemer_timeout_wraps_subprocess_timeout(monkeypatch):
 
     with patch("services.omr._run_streaming", side_effect=slow):
         with pytest.raises(RuntimeError, match="timed out"):
-            OemerOMR(timeout_seconds=1).image_to_musicxml(b"x", media_type="image/png")
+            OemerOMR(timeout_seconds=1, max_dim=0).image_to_musicxml(b"x", media_type="image/png")
+
+
+def test_downscale_resizes_when_above_max_dim():
+    """A 4000x3000 image should be downscaled below max_dim."""
+    from io import BytesIO
+    from PIL import Image
+    from services.omr import _downscale_png
+
+    big = Image.new("RGB", (4000, 3000), color="white")
+    buf = BytesIO()
+    big.save(buf, format="PNG")
+    out = _downscale_png(buf.getvalue(), max_dim=2000)
+
+    result = Image.open(BytesIO(out))
+    assert max(result.size) == 2000
+    assert result.size == (2000, 1500)
+
+
+def test_downscale_passthrough_when_below_max_dim():
+    from io import BytesIO
+    from PIL import Image
+    from services.omr import _downscale_png
+
+    small = Image.new("RGB", (1000, 800), color="white")
+    buf = BytesIO()
+    small.save(buf, format="PNG")
+    raw = buf.getvalue()
+    out = _downscale_png(raw, max_dim=2000)
+    assert out is raw  # no resize, original bytes returned
 
 
 def test_oemer_passes_without_deskew_flag(monkeypatch):
@@ -100,6 +129,6 @@ def test_oemer_passes_without_deskew_flag(monkeypatch):
         return _StreamResult(0, "")
 
     with patch("services.omr._run_streaming", side_effect=runner):
-        OemerOMR(without_deskew=True).image_to_musicxml(b"x", media_type="image/png")
+        OemerOMR(without_deskew=True, max_dim=0).image_to_musicxml(b"x", media_type="image/png")
 
     assert "-d" in captured_cmd["cmd"]
