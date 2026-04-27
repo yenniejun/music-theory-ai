@@ -19,6 +19,42 @@ from pathlib import Path
 from typing import Protocol
 
 
+class _StreamResult:
+    __slots__ = ("returncode", "output")
+
+    def __init__(self, returncode: int, output: str):
+        self.returncode = returncode
+        self.output = output
+
+
+def _run_streaming(cmd: list[str], timeout: int) -> _StreamResult:
+    """Run a subprocess, streaming each output line to our logger as it arrives.
+
+    Lets us see oemer's progress in real time instead of waiting for completion.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    lines: list[str] = []
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            stripped = line.rstrip()
+            if stripped:
+                log.info("[oemer] %s", stripped)
+                lines.append(stripped)
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    return _StreamResult(proc.returncode, "\n".join(lines))
+
+
 def _find_executable(name: str) -> str | None:
     """Resolve a CLI tool that may be installed in the active venv but not on PATH."""
     found = shutil.which(name)
@@ -66,9 +102,19 @@ class OemerOMR:
     the result back.
     """
 
-    def __init__(self, oemer_bin: str | None = None, timeout_seconds: int = 240):
+    def __init__(self, oemer_bin: str | None = None, timeout_seconds: int | None = None,
+                 without_deskew: bool | None = None):
         self.oemer_bin = oemer_bin or os.environ.get("OEMER_BIN", "oemer")
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else int(os.environ.get("OEMER_TIMEOUT", "900"))
+        )
+        self.without_deskew = (
+            without_deskew
+            if without_deskew is not None
+            else os.environ.get("OEMER_NO_DESKEW", "").lower() in ("1", "true", "yes")
+        )
 
     def image_to_musicxml(self, image_bytes: bytes, media_type: str = "image/png") -> str:
         resolved = _find_executable(self.oemer_bin)
@@ -90,27 +136,26 @@ class OemerOMR:
             img_path.write_bytes(image_bytes)
 
             cmd = [resolved, str(img_path), "-o", str(tmp)]
-            log.info("Running oemer: %s", " ".join(cmd))
+            if self.without_deskew:
+                cmd.append("-d")
+            log.info("Running oemer (timeout=%ss): %s", self.timeout_seconds, " ".join(cmd))
             try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout_seconds,
-                    check=False,
-                )
+                result = _run_streaming(cmd, timeout=self.timeout_seconds)
             except subprocess.TimeoutExpired as e:
-                raise RuntimeError(f"oemer timed out after {self.timeout_seconds}s") from e
+                raise RuntimeError(
+                    f"oemer timed out after {self.timeout_seconds}s. "
+                    "Bump OEMER_TIMEOUT or try a smaller / less dense image."
+                ) from e
 
             if result.returncode != 0:
                 raise RuntimeError(
-                    f"oemer exited {result.returncode}: {result.stderr.strip() or result.stdout.strip()}"
+                    f"oemer exited {result.returncode}: {result.output.strip()[-500:]}"
                 )
 
             xml_files = list(tmp.glob("*.musicxml")) + list(tmp.glob("*.xml"))
             if not xml_files:
                 raise RuntimeError(
-                    f"oemer produced no MusicXML output. stdout={result.stdout!r} stderr={result.stderr!r}"
+                    f"oemer produced no MusicXML output. output={result.output!r}"
                 )
             return xml_files[0].read_text(encoding="utf-8")
 
