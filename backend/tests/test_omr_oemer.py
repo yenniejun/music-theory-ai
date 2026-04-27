@@ -125,6 +125,15 @@ def test_oemer_writes_cache_after_run(monkeypatch, tmp_path):
     assert cached.read_text() == SAMPLE_XML
 
 
+def test_stage_progress_maps_known_markers():
+    from services.omr import _stage_progress
+    assert _stage_progress("2026-01-01 Extracting staffline and symbols") == 0
+    assert _stage_progress("Extracting layers of different symbols") == 50
+    assert _stage_progress("Extracting noteheads") == 90
+    assert _stage_progress("Build MusicXML") == 98
+    assert _stage_progress("random unrelated line") is None
+
+
 def test_oemer_passes_save_cache_flag(monkeypatch, tmp_path):
     """The --save-cache flag is passed to oemer so its inference pickles persist."""
     monkeypatch.setattr("services.omr._find_executable", lambda name: "/usr/local/bin/oemer")

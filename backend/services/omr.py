@@ -28,10 +28,32 @@ class _StreamResult:
         self.output = output
 
 
+# Map of oemer stage messages -> approximate cumulative completion %.
+# Stages 1 and 2 are slow model inferences (~50% of runtime each). The
+# remaining stages are fast CV/heuristics on numpy arrays.
+_STAGE_PROGRESS = [
+    ("Extracting staffline and symbols", 0),
+    ("Extracting layers of different symbols", 50),
+    ("Extracting noteheads", 90),
+    ("Extracting groups of note", 92),
+    ("Extracting symbols", 94),
+    ("Parsing rhythm", 96),
+    ("Build MusicXML", 98),
+]
+
+
+def _stage_progress(line: str) -> int | None:
+    for marker, pct in _STAGE_PROGRESS:
+        if marker in line:
+            return pct
+    return None
+
+
 def _run_streaming(cmd: list[str], timeout: int) -> _StreamResult:
     """Run a subprocess, streaming each output line to our logger as it arrives.
 
     Lets us see oemer's progress in real time instead of waiting for completion.
+    Recognized stage strings are tagged with a cumulative %.
     """
     proc = subprocess.Popen(
         cmd,
@@ -45,9 +67,14 @@ def _run_streaming(cmd: list[str], timeout: int) -> _StreamResult:
         assert proc.stdout is not None
         for line in proc.stdout:
             stripped = line.rstrip()
-            if stripped:
+            if not stripped:
+                continue
+            pct = _stage_progress(stripped)
+            if pct is not None:
+                log.info("[oemer] [~%d%%] %s", pct, stripped)
+            else:
                 log.info("[oemer] %s", stripped)
-                lines.append(stripped)
+            lines.append(stripped)
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
